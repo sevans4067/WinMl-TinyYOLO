@@ -21,6 +21,13 @@ using Windows.UI.Xaml.Media.Imaging;
 using Windows.UI.Xaml.Navigation;
 using Windows.UI.Xaml.Shapes;
 using Windows.UI.Text;
+using Windows.Media.Capture;
+using Windows.Media.MediaProperties;
+using Windows.System.Threading;
+using System.Threading;
+using System.Diagnostics;
+using Windows.Media.Devices;
+using Windows.Devices.Enumeration;
 
 namespace TinyYOLO
 {
@@ -30,7 +37,12 @@ namespace TinyYOLO
 
         private readonly SolidColorBrush lineBrush = new SolidColorBrush(Windows.UI.Colors.Yellow);
         private readonly SolidColorBrush fillBrush = new SolidColorBrush(Windows.UI.Colors.Transparent);
-        private readonly double lineThickness = 2.0;        
+        private readonly double lineThickness = 2.0;
+
+        private MediaCapture _captureManager;
+        private VideoEncodingProperties _videoProperties;
+        private ThreadPoolTimer _frameProcessingTimer;
+        private SemaphoreSlim _frameProcessingSemaphore = new SemaphoreSlim(1);
 
         private ImageVariableDescriptorPreview inputImageDescription;
         private TensorVariableDescriptorPreview outputTensorDescription;
@@ -44,10 +56,17 @@ namespace TinyYOLO
             this.InitializeComponent();
         }
 
+        protected override async void OnNavigatedTo(NavigationEventArgs e)
+        {
+            base.OnNavigatedTo(e);
+
+            await LoadModelAsync();
+        }
+
         private async void ButtonRun_Click(object sender, RoutedEventArgs e)
         {
             ButtonRun.IsEnabled = false;
-            
+
             try
             {
                 // Load the model
@@ -82,17 +101,7 @@ namespace TinyYOLO
                     await EvaluateVideoFrameAsync(inputImage);
                 });
 
-                this.OverlayCanvas.Children.Clear();
-
-                // Render output
-                if (this.boxes.Count > 0)
-                {
-                    // Remove overalapping and low confidence bounding boxes
-                    var filteredBoxes = this.parser.NonMaxSuppress(this.boxes, 5, .5F);
-
-                    foreach (var box in filteredBoxes)
-                        await this.DrawYoloBoundingBoxAsync(inputImage.SoftwareBitmap, box);
-                }
+                await DrawOverlays(inputImage);
             }
             catch (Exception ex)
             {
@@ -101,7 +110,150 @@ namespace TinyYOLO
             }
         }
 
-        private async Task LoadModelAsync()
+        private async Task DrawOverlays(VideoFrame inputImage)
+        {
+            this.OverlayCanvas.Children.Clear();
+
+            // Render output
+            if (this.boxes.Count > 0)
+            {
+                // Remove overalapping and low confidence bounding boxes
+                var filteredBoxes = this.parser.NonMaxSuppress(this.boxes, 5, .5F);
+
+                foreach (var box in filteredBoxes)
+                    await this.DrawYoloBoundingBoxAsync(inputImage.SoftwareBitmap, box);
+            }
+        }
+
+        private async void OnWebCameraButtonClicked(object sender, RoutedEventArgs e)
+        {
+            if (_captureManager == null || _captureManager.CameraStreamState != CameraStreamState.Streaming)
+            {
+                await StartWebCameraAsync();
+            }
+            else
+            {
+                await StopWebCameraAsync();
+            }
+        }
+
+        private async void OnDeviceToggleToggled(object sender, RoutedEventArgs e)
+        {
+            await LoadModelAsync(DeviceToggle.IsOn);
+        }
+
+        /// <summary>
+        /// Event handler for camera source changes
+        /// </summary>
+        private async Task StartWebCameraAsync()
+        {
+            try
+            {
+                if (_captureManager == null ||
+                    _captureManager.CameraStreamState == CameraStreamState.Shutdown ||
+                    _captureManager.CameraStreamState == CameraStreamState.NotStreaming)
+                {
+                    if (_captureManager != null)
+                    {
+                        _captureManager.Dispose();
+                    }
+
+                    // Workaround since my home built-in camera does not work as expected, so have to use my LifeCam
+                    MediaCaptureInitializationSettings settings = new MediaCaptureInitializationSettings();
+                    var allCameras = await DeviceInformation.FindAllAsync(DeviceClass.VideoCapture);
+                    var selectedCamera = allCameras.FirstOrDefault(c => c.Name.Contains("LifeCam")) ?? allCameras.FirstOrDefault();
+                    if (selectedCamera != null)
+                    {
+                        settings.VideoDeviceId = selectedCamera.Id;
+                    }
+                    //settings.PreviewMediaDescription = new MediaCaptureVideoProfileMediaDescription()
+
+                    _captureManager = new MediaCapture();
+                    await _captureManager.InitializeAsync(settings);
+
+                    WebCamCaptureElement.Source = _captureManager;
+                }
+
+                if (_captureManager.CameraStreamState == CameraStreamState.NotStreaming)
+                {
+                    if (_frameProcessingTimer != null)
+                    {
+                        _frameProcessingTimer.Cancel();
+                        _frameProcessingSemaphore.Release();
+                    }
+
+                    TimeSpan timerInterval = TimeSpan.FromMilliseconds(66); //15fps
+                    _frameProcessingTimer = ThreadPoolTimer.CreatePeriodicTimer(new TimerElapsedHandler(ProcessCurrentVideoFrame), timerInterval);
+
+                    _videoProperties = _captureManager.VideoDeviceController.GetMediaStreamProperties(MediaStreamType.VideoPreview) as VideoEncodingProperties;
+
+                    await _captureManager.StartPreviewAsync();
+
+                    WebCamCaptureElement.Visibility = Visibility.Visible;
+                }
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => StatusBlock.Text = $"error: {ex.Message}");
+            }
+        }
+
+        public async Task StopWebCameraAsync()
+        {
+            try
+            {
+                if (_frameProcessingTimer != null)
+                {
+                    _frameProcessingTimer.Cancel();
+                }
+
+                if (_captureManager != null && _captureManager.CameraStreamState != CameraStreamState.Shutdown)
+                {
+                    await _captureManager.StopPreviewAsync();
+                    WebCamCaptureElement.Source = null;
+                    _captureManager.Dispose();
+                    _captureManager = null;
+
+                    WebCamCaptureElement.Visibility = Visibility.Collapsed;
+                }
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => StatusBlock.Text = $"error: {ex.Message}");
+            }
+        }
+
+        private async void ProcessCurrentVideoFrame(ThreadPoolTimer timer)
+        {
+            if (_captureManager.CameraStreamState != CameraStreamState.Streaming || !_frameProcessingSemaphore.Wait(0))
+            {
+                return;
+            }
+
+            try
+            {
+                const BitmapPixelFormat InputPixelFormat = BitmapPixelFormat.Bgra8;
+                VideoFrame previewFrame = new VideoFrame(InputPixelFormat, (int)_videoProperties.Width, (int)_videoProperties.Height);
+                await _captureManager.GetPreviewFrameAsync(previewFrame);
+                await EvaluateVideoFrameAsync(previewFrame);
+                await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, async () => 
+                {
+                    await DrawOverlays(previewFrame);
+                    previewFrame.Dispose();
+                });
+
+            }
+            catch (Exception ex)
+            {
+                await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => StatusBlock.Text = $"error: {ex.Message}");
+            }
+            finally
+            {
+                _frameProcessingSemaphore.Release();
+            }
+        }
+
+        private async Task LoadModelAsync(bool isGpu = true)
         {
             if (this.model != null)
                 return;
@@ -113,6 +265,8 @@ namespace TinyYOLO
                 // Load Model
                 var modelFile = await StorageFile.GetFileFromApplicationUriAsync(new Uri($"ms-appx:///Assets/{ MODEL_FILENAME }"));
                 this.model = await LearningModelPreview.LoadModelFromStorageFileAsync(modelFile);
+                this.model.InferencingOptions.ReclaimMemoryAfterEvaluation = true;
+                this.model.InferencingOptions.PreferredDeviceKind = isGpu == true ? LearningModelDeviceKindPreview.LearningDeviceGpu : LearningModelDeviceKindPreview.LearningDeviceCpu;
 
                 // Retrieve model input and output variable descriptions (we already know the model takes an image in and outputs a tensor)
                 var inputFeatures = this.model.Description.InputFeatures.ToList();
@@ -125,6 +279,9 @@ namespace TinyYOLO
                 this.outputTensorDescription =
                     outputFeatures.FirstOrDefault(feature => feature.ModelFeatureKind == LearningModelFeatureKindPreview.Tensor)
                     as TensorVariableDescriptorPreview;
+
+                await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => StatusBlock.Text = $"Loaded { MODEL_FILENAME }. Press the camera button to start the webcam...");
+
             }
             catch (Exception ex)
             {
@@ -143,21 +300,26 @@ namespace TinyYOLO
                     var binding = new LearningModelBindingPreview(this.model as LearningModelPreview);
 
                     // R4 WinML does needs the output pre-allocated for multi-dimensional tensors
-                    var outputArray = new List<float>(); 
+                    var outputArray = new List<float>();
                     outputArray.AddRange(new float[21125]);  // Total size of TinyYOLO output
 
                     binding.Bind(this.inputImageDescription.Name, inputFrame);
                     binding.Bind(this.outputTensorDescription.Name, outputArray);
 
                     // Process the frame with the model
+                    var stopwatch = Stopwatch.StartNew();
                     var results = await this.model.EvaluateAsync(binding, "TinyYOLO");
-                    var resultProbabilities = 
-                        results.Outputs[this.outputTensorDescription.Name] as List<float>;
+                    stopwatch.Stop();
+                    var resultProbabilities = results.Outputs[this.outputTensorDescription.Name] as List<float>;
 
                     // Use out helper to parse to the YOLO outputs into bounding boxes with labels
                     this.boxes = this.parser.ParseOutputs(resultProbabilities.ToArray(), .3F);
 
-                    await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => StatusBlock.Text = "Model Evaluation Completed");
+                    await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+                    {
+                        Duration.Text = $"{1000f / stopwatch.ElapsedMilliseconds,4:f1} fps";
+                        StatusBlock.Text = "Model Evaluation Completed";
+                    });
                 }
                 catch (Exception ex)
                 {

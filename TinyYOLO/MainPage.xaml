@@ -9,8 +9,9 @@
 
     <Grid Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
         <StackPanel>
-            <!--Image picker-->
-            <Button Name="ButtonRun"
+            <StackPanel Orientation="Horizontal">
+                <!--Image picker-->
+                <Button Name="ButtonRun"
                     ToolTipService.ToolTip="Pick and evaluate and image"
                     Width="80"
                     Height="80"
@@ -18,19 +19,41 @@
                     IsEnabled="True" 
                     HorizontalAlignment="Left" 
                     VerticalAlignment="Top">
-                <Button.Content>
-                    <SymbolIcon Symbol="Upload" />
-                </Button.Content>
-            </Button>
+                    <Button.Content>
+                        <SymbolIcon Symbol="Upload" />
+                    </Button.Content>
+                </Button>
+                <Button Name="ButtonCam"
+                    ToolTipService.ToolTip="Turn on/off webcam"
+                    Width="80"
+                    Height="80"
+                    Click="OnWebCameraButtonClicked" 
+                    IsEnabled="True" 
+                    HorizontalAlignment="Left" 
+                    VerticalAlignment="Top">
+                    <Button.Content>
+                        <SymbolIcon Symbol="Video" />
+                    </Button.Content>
+                </Button>
+                <ToggleSwitch x:Name="DeviceToggle"
+                          HorizontalAlignment="Right"
+                          Header="Preferred device"
+                          OffContent="CPU"
+                          OnContent="GPU"
+                          IsOn="True"
+                          Toggled="OnDeviceToggleToggled" />
+            </StackPanel>
+
 
             <!--Result and status text block-->
+            <TextBlock x:Name="Duration" Text="0 fps" FontSize="14"/>
             <TextBlock x:Name="StatusBlock" 
                        FontWeight="Bold" 
                        TextWrapping="Wrap"  
                        Text="Press on the button to select and image and run it through TinyYOLO!"/>
 
-            <!--Image preview -->
-            <Canvas Name="OverlayCanvas" Width="416" Height="416" />
+            <CaptureElement x:Name="WebCamCaptureElement" Stretch="Fill" VerticalAlignment="Center" HorizontalAlignment="Left" Width="320" Height="240"/>
+            <Canvas Name="OverlayCanvas" VerticalAlignment="Center" HorizontalAlignment="Left"  Width="416" Height="416" />
         </StackPanel>
     </Grid>
 </Page>
